@@ -5,16 +5,11 @@ Upload exactly four chronological images/FITS files.
 
 Pipeline:
     4 images
-      -> load at native resolution
-      -> if larger than IMAGE_SIZE: split into overlapping
-         IMAGE_SIZE x IMAGE_SIZE windows (same window layout for all
-         four frames); otherwise use a single window (old behavior)
-      -> per window: four-frame temporal median BLIP -> V5-Multi
-         ConvLSTM -> up to MAX_TARGETS trajectory slots
-      -> window-local coordinates offset back to full-image
-         coordinates
+      -> load/normalize
+      -> complete four-frame temporal median BLIP
+      -> V5-Multi ConvLSTM
+      -> up to MAX_TARGETS trajectory slots
       -> confidence filtering
-      -> duplicate detections from overlapping windows merged
       -> colored trajectory visualization
 
 This is an inference/visualization app only. It does not retrain the model.
@@ -39,21 +34,9 @@ from model import V5MultiTargetDetector
 # CONFIG
 # ============================================================
 
-MODEL_PATH = BASE_DIR / "v5m_overnight.pth"
+MODEL_PATH = BASE_DIR / "v5m_quick.pth"
 
 DEFAULT_THRESHOLD = 0.50
-
-# If the uploaded frames are larger than IMAGE_SIZE in either dimension,
-# we scan them with a sliding window instead of squashing the whole
-# frame down to IMAGE_SIZE. WINDOW_STRIDE < IMAGE_SIZE means windows
-# overlap, so a target sitting near a window edge is still fully
-# visible in at least one neighboring window.
-WINDOW_STRIDE = 192
-
-# Detections from overlapping windows that land within this many
-# pixels (in original-image coordinates) of a higher-confidence
-# detection are treated as duplicates of the same object.
-DEDUPE_DIST_PX = 15.0
 
 
 # ============================================================
@@ -181,14 +164,6 @@ constructed. The model then makes one retrospective inference over
 the complete four-frame sequence.
 </p>
 
-<p class="small">
-Frames up to {{ '%d'|format(256) }}x{{ '%d'|format(256) }} are used
-as-is. Larger frames are scanned with an overlapping sliding window
-instead of being resized down, so full-resolution pixel scale is
-preserved; overlapping detections of the same object are merged
-automatically.
-</p>
-
 <form method="post" enctype="multipart/form-data">
 
 <label>
@@ -307,20 +282,10 @@ BLIP all 4 + detect trajectories
 </div>
 
 
-{% if heat_img %}
 <div class="card">
 <h3>4. Final spatial evidence for all target slots</h3>
 <img src="data:image/png;base64,{{heat_img}}">
 </div>
-{% else %}
-<div class="card">
-<h3>4. Final spatial evidence for all target slots</h3>
-<p class="small">
-Not shown: the frame was scanned as multiple overlapping windows,
-so there isn't one single heatmap for the whole image.
-</p>
-</div>
-{% endif %}
 
 {% endif %}
 
@@ -375,10 +340,6 @@ def load_uploaded_image(file_storage):
     """
     Supports common image formats and FITS.
 
-    Returns the frame at its NATIVE resolution (no resizing here).
-    Sizing/windowing is decided once all four frames are loaded,
-    since that decision depends on their shared shape.
-
     FITS normalization is for visualization/prototyping and should
     not be interpreted as calibrated astronomical photometry.
     """
@@ -407,24 +368,16 @@ def load_uploaded_image(file_storage):
                     "No image data found in FITS file."
                 )
 
-        return normalize_fits(image)
+        image = normalize_fits(image)
 
-    image = Image.open(
-        file_storage.stream
-    ).convert("L")
+        image = Image.fromarray(
+            (image * 255).astype(np.uint8)
+        )
 
-    return np.asarray(
-        image,
-        dtype=np.float32,
-    ) / 255.0
-
-
-def resize_to_model_input(arr):
-    """Old single-frame behavior: squash the whole frame to IMAGE_SIZE."""
-
-    image = Image.fromarray(
-        (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
-    )
+    else:
+        image = Image.open(
+            file_storage.stream
+        ).convert("L")
 
     image = image.resize(
         (IMAGE_SIZE, IMAGE_SIZE),
@@ -435,32 +388,6 @@ def resize_to_model_input(arr):
         image,
         dtype=np.float32,
     ) / 255.0
-
-
-def get_window_boxes(h, w, window=IMAGE_SIZE, stride=WINDOW_STRIDE):
-    """
-    Top-left (x, y) coordinates of every window needed to cover an
-    h x w image, stepping by `stride` and always including a final
-    window flush with the right/bottom edge so nothing is missed.
-    """
-
-    def axis_positions(length):
-        if length <= window:
-            return [0]
-
-        positions = list(
-            range(0, length - window + 1, stride)
-        )
-
-        if positions[-1] != length - window:
-            positions.append(length - window)
-
-        return positions
-
-    xs = axis_positions(w)
-    ys = axis_positions(h)
-
-    return [(x, y) for y in ys for x in xs]
 
 
 # ============================================================
@@ -773,40 +700,6 @@ def infer(blips, threshold):
     )
 
 
-def dedupe_tracks(tracks, dist_thresh=DEDUPE_DIST_PX):
-    """
-    Overlapping windows can each independently detect the same real
-    object. Keep the highest-confidence detection and drop any other
-    detection whose start point falls within dist_thresh pixels of
-    an already-kept one (in global image coordinates).
-    """
-
-    ordered = sorted(
-        tracks,
-        key=lambda t: t["confidence"],
-        reverse=True,
-    )
-
-    kept = []
-
-    for t in ordered:
-        is_duplicate = any(
-            np.hypot(
-                t["start_x"] - k["start_x"],
-                t["start_y"] - k["start_y"],
-            ) < dist_thresh
-            for k in kept
-        )
-
-        if not is_duplicate:
-            kept.append(t)
-
-    for new_id, t in enumerate(kept):
-        t["id"] = new_id
-
-    return kept
-
-
 # ============================================================
 # ROUTE
 # ============================================================
@@ -857,101 +750,23 @@ def home():
             )
 
         # IMPORTANT:
-        # Load ALL FOUR (native resolution) before deciding anything.
-        raw_native = [
-            load_uploaded_image(f)
-            for f in uploads
-        ]
-
-        native_shapes = {
-            a.shape for a in raw_native
-        }
-
-        if len(native_shapes) != 1:
-            raise ValueError(
-                "All four frames must be the same size, but got: "
-                f"{[a.shape for a in raw_native]}"
-            )
-
-        h, w = raw_native[0].shape
-        windowed = max(h, w) > IMAGE_SIZE
-
-        if not windowed:
-            # Small enough to fit: same behavior as before, whole
-            # frame squashed to IMAGE_SIZE x IMAGE_SIZE.
-            raw = np.stack(
-                [resize_to_model_input(a) for a in raw_native],
-                axis=0,
-            )
-
-            boxes = [(0, 0)]
-
-        else:
-            # Larger than the model's input: scan with a sliding
-            # window instead of downsizing the whole frame.
-            raw = np.stack(raw_native, axis=0)
-            boxes = get_window_boxes(h, w)
-
-        all_tracks = []
-        start_logits = None  # only kept for the single-window case
-
-        for (bx, by) in boxes:
-
-            crop = raw[
-                :,
-                by:by + IMAGE_SIZE,
-                bx:bx + IMAGE_SIZE,
-            ]
-
-            # Edge windows on a frame smaller than IMAGE_SIZE in one
-            # dimension still need to be padded up to IMAGE_SIZE.
-            ch, cw = crop.shape[1], crop.shape[2]
-
-            if ch < IMAGE_SIZE or cw < IMAGE_SIZE:
-                padded = np.zeros(
-                    (4, IMAGE_SIZE, IMAGE_SIZE),
-                    dtype=np.float32,
-                )
-                padded[:, :ch, :cw] = crop
-                crop = padded
-
-            blips = make_blips(crop)
-
-            window_tracks, window_start_logits = infer(
-                blips,
-                threshold,
-            )
-
-            for t in window_tracks:
-                t["start_x"] += bx
-                t["start_y"] += by
-
-                t["points"] = [
-                    [p[0] + bx, p[1] + by]
-                    for p in t["points"]
-                ]
-
-                t["hard_points"] = [
-                    [p[0] + bx, p[1] + by]
-                    for p in t["hard_points"]
-                ]
-
-            all_tracks.extend(window_tracks)
-
-            if not windowed:
-                start_logits = window_start_logits
-
-        tracks = dedupe_tracks(all_tracks) if windowed else all_tracks
-
-        tracks.sort(
-            key=lambda t: t["confidence"],
-            reverse=True,
+        # Load ALL FOUR before making any BLIP.
+        raw = np.stack(
+            [
+                load_uploaded_image(f)
+                for f in uploads
+            ],
+            axis=0,
         )
 
-        # Full-resolution BLIP purely for the visualization panels
-        # below (the model itself only ever sees IMAGE_SIZE crops,
-        # one window at a time).
-        display_blips = make_blips(raw)
+        blips = make_blips(
+            raw
+        )
+
+        tracks, start_logits = infer(
+            blips,
+            threshold,
+        )
 
         raw_img = plot_four_frames(
             raw,
@@ -966,7 +781,7 @@ def home():
         )
 
         blip_img = plot_four_frames(
-            display_blips,
+            blips,
             [
                 "BLIP F0",
                 "BLIP F1",
@@ -978,18 +793,12 @@ def home():
         )
 
         infer_img = plot_tracks(
-            display_blips,
+            blips,
             tracks,
         )
 
-        # Per-slot heatmaps only correspond to a single window's
-        # inference, so they're only shown when the whole frame fit
-        # in one window. With many overlapping windows there's no
-        # single heatmap that represents the full mosaic.
-        heat_img = (
-            plot_heatmaps(start_logits)
-            if start_logits is not None
-            else None
+        heat_img = plot_heatmaps(
+            start_logits
         )
 
         if tracks:
@@ -1002,13 +811,6 @@ def home():
             summary = (
                 f"No trajectory exceeded "
                 f"threshold {threshold:.2f}."
-            )
-
-        if windowed:
-            summary += (
-                f" Scanned {len(boxes)} windows "
-                f"({IMAGE_SIZE}px, stride {WINDOW_STRIDE}px) "
-                f"across a {w}x{h} image."
             )
 
         return render_template_string(
