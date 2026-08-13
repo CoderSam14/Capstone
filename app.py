@@ -1,868 +1,335 @@
 """
-V5-MULTI web app.
+app.py
+------
+Streamlit inference app for the V1 multi-target ConvLSTM tracklet detector.
 
-Upload exactly four chronological images/FITS files.
+Drop in SEQ_LEN (4) frames as .fits/.fit or .png, in time order. The app:
+  1. Loads and resizes each frame to IMAGE_SIZE x IMAGE_SIZE.
+  2. Runs the EXACT same BLIP preprocessing used in training
+     (env_gen.make_blips: median-frame differencing + robust MAD
+     normalization), so inference sees the representation the model
+     was actually trained on.
+  3. Runs the trained V5MultiTargetDetector checkpoint.
+  4. Shows per-slot detections (position / velocity / confidence),
+     an annotated frame grid, and an animated GIF with predicted
+     tracks overlaid.
 
-Pipeline:
-    4 images
-      -> load/normalize
-      -> complete four-frame temporal median BLIP
-      -> V5-Multi ConvLSTM
-      -> up to MAX_TARGETS trajectory slots
-      -> confidence filtering
-      -> colored trajectory visualization
+Place this file alongside config.py / env_gen.py / model.py, e.g.:
+    C:\\#Self Study\\Projects\\Casptone Prototype\\src\\app.py
 
-This is an inference/visualization app only. It does not retrain the model.
+Install (once):
+    pip install streamlit torch numpy pillow astropy
+
+Run:
+    streamlit run app.py
 """
 
 import io
-import base64
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+import streamlit as st
 import torch
-import matplotlib.pyplot as plt
-from PIL import Image
-from flask import Flask, request, render_template_string
-from astropy.io import fits
+from PIL import Image, ImageDraw
+
+try:
+    from astropy.io import fits
+    HAVE_ASTROPY = True
+except ImportError:
+    HAVE_ASTROPY = False
 
 from config import *
+from env_gen import make_blips
 from model import V5MultiTargetDetector
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-MODEL_PATH = BASE_DIR / "v5m_quick.pth"
-
-DEFAULT_THRESHOLD = 0.50
-
-
-# ============================================================
-# APP / MODEL
-# ============================================================
-
-app = Flask(__name__)
-
-device = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
+# ---------------------------------------------------------------- #
+# Page setup
+# ---------------------------------------------------------------- #
+st.set_page_config(
+    page_title="Asteroid Tracklet Detector (V1 ConvLSTM)",
+    layout="wide",
 )
 
-model = V5MultiTargetDetector().to(device)
-
-if not MODEL_PATH.exists():
-    raise FileNotFoundError(
-        f"Model checkpoint not found:\n{MODEL_PATH}\n"
-        "Train V5-M first or change MODEL_PATH in app.py."
-    )
-
-checkpoint = torch.load(
-    MODEL_PATH,
-    map_location=device,
-    weights_only=False,
+st.title("Asteroid Tracklet Detector — ConvLSTM Prototype")
+st.caption(
+    "Upload 4 sequential frames (FITS or PNG). The app rebuilds the "
+    "exact BLIP preprocessing used in training, runs the trained "
+    "ConvLSTM detector, and returns detections plus an annotated GIF. "
+    "Note: this checkpoint was trained entirely on synthetic data — "
+    "treat outputs on real frames as a feasibility check, not a "
+    "calibrated result."
 )
 
-model.load_state_dict(
-    checkpoint["model"]
+
+# ---------------------------------------------------------------- #
+# Model loading
+# ---------------------------------------------------------------- #
+@st.cache_resource(show_spinner="Loading model...")
+def load_model(checkpoint_path: str):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = V5MultiTargetDetector().to(device)
+
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+
+    return model, device, ckpt.get("epoch", "?"), ckpt.get("run_name", "?")
+
+
+# ---------------------------------------------------------------- #
+# Sidebar - checkpoint + thresholds
+# ---------------------------------------------------------------- #
+st.sidebar.header("Model")
+
+default_ckpt = str(BASE_DIR / "v5m_overnight.pth")
+checkpoint_path = st.sidebar.text_input("Checkpoint path (.pth)", value=default_ckpt)
+
+confidence_threshold = st.sidebar.slider(
+    "Presence confidence threshold", 0.0, 1.0, 0.50, 0.01
 )
 
-model.eval()
-
-print(f"[INFO] Device: {device}")
-print(f"[INFO] Model: {MODEL_PATH}")
-
-
-# ============================================================
-# HTML
-# ============================================================
-
-HTML = r"""
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>V5-M Multi-Target ConvLSTM Detector</title>
-
-<style>
-body {
-    background:#09111b;
-    color:#eeeeee;
-    font-family:Segoe UI,Arial,sans-serif;
-    padding:28px;
-    max-width:1450px;
-    margin:auto;
-}
-
-.card {
-    background:#101c2b;
-    border:1px solid #26384d;
-    border-radius:12px;
-    padding:20px;
-    margin-bottom:18px;
-}
-
-input, button {
-    margin:7px;
-    padding:9px;
-}
-
-button {
-    cursor:pointer;
-    font-weight:600;
-}
-
-img {
-    max-width:100%;
-    border-radius:8px;
-}
-
-.err {
-    color:#ff9b9b;
-}
-
-.good {
-    color:#9ff0b0;
-}
-
-table {
-    border-collapse:collapse;
-    width:100%;
-}
-
-td, th {
-    border-bottom:1px solid #26384d;
-    padding:8px;
-    text-align:left;
-}
-
-code {
-    color:#a9d7ff;
-}
-
-.small {
-    color:#aab7c5;
-    font-size:0.92em;
-}
-</style>
-</head>
-
-<body>
-
-<h2>V5-M Multi-Target ConvLSTM Detector</h2>
-
-<div class="card">
-
-<p>
-Upload <b>exactly four chronological frames</b>.
-PNG/JPG/TIFF/BMP and astronomical FITS files are supported.
-</p>
-
-<p class="small">
-All four frames are loaded before the temporal BLIP reference is
-constructed. The model then makes one retrospective inference over
-the complete four-frame sequence.
-</p>
-
-<form method="post" enctype="multipart/form-data">
-
-<label>
-Frame 0:
-<input type="file" name="f0"
-accept="image/*,.fits,.fit,.fts" required>
-</label>
-<br>
-
-<label>
-Frame 1:
-<input type="file" name="f1"
-accept="image/*,.fits,.fit,.fts" required>
-</label>
-<br>
-
-<label>
-Frame 2:
-<input type="file" name="f2"
-accept="image/*,.fits,.fit,.fts" required>
-</label>
-<br>
-
-<label>
-Frame 3:
-<input type="file" name="f3"
-accept="image/*,.fits,.fit,.fts" required>
-</label>
-<br>
-
-<label>
-Confidence threshold:
-<input
-type="number"
-name="threshold"
-min="0"
-max="1"
-step="0.01"
-value="{{threshold if threshold else 0.50}}"
->
-</label>
-
-<br>
-
-<button type="submit">
-BLIP all 4 + detect trajectories
-</button>
-
-</form>
-</div>
-
-
-{% if error %}
-<div class="card err">
-<b>Error:</b> {{error}}
-</div>
-{% endif %}
-
-
-{% if results %}
-
-<div class="card">
-
-<h3>Detection summary</h3>
-
-<p class="good">
-{{summary}}
-</p>
-
-<table>
-<tr>
-<th>Track</th>
-<th>Confidence</th>
-<th>Start (x,y)</th>
-<th>Velocity (vx,vy)</th>
-<th>Frame 0</th>
-<th>Frame 1</th>
-<th>Frame 2</th>
-<th>Frame 3</th>
-</tr>
-
-{% for r in results %}
-<tr>
-<td>Track {{r.id}}</td>
-<td>{{"%.4f"|format(r.confidence)}}</td>
-<td>({{"%.1f"|format(r.start_x)}}, {{"%.1f"|format(r.start_y)}})</td>
-<td>({{"%.2f"|format(r.vx)}}, {{"%.2f"|format(r.vy)}})</td>
-
-{% for p in r.points %}
-<td>({{"%.1f"|format(p[0])}}, {{"%.1f"|format(p[1])}})</td>
-{% endfor %}
-
-</tr>
-{% endfor %}
-
-</table>
-
-</div>
-
-
-<div class="card">
-<h3>1. Uploaded / normalized frames</h3>
-<img src="data:image/png;base64,{{raw_img}}">
-</div>
-
-
-<div class="card">
-<h3>2. Signed BLIP frames actually fed to V5-M</h3>
-<img src="data:image/png;base64,{{blip_img}}">
-</div>
-
-
-<div class="card">
-<h3>3. Multiple inferred trajectories</h3>
-<img src="data:image/png;base64,{{infer_img}}">
-</div>
-
-
-<div class="card">
-<h3>4. Final spatial evidence for all target slots</h3>
-<img src="data:image/png;base64,{{heat_img}}">
-</div>
-
-{% endif %}
-
-</body>
-</html>
-"""
-
-
-# ============================================================
-# IMAGE LOADING
-# ============================================================
-
-def normalize_fits(data):
-    data = np.asarray(
-        data,
-        dtype=np.float32,
-    )
-
-    data = np.squeeze(data)
-
-    while data.ndim > 2:
-        data = data[0]
-
-    if data.ndim != 2:
-        raise ValueError(
-            f"Unsupported FITS dimensions: {data.shape}"
-        )
-
-    data = np.nan_to_num(
-        data,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-
-    lo = np.percentile(data, 1.0)
-    hi = np.percentile(data, 99.5)
-
-    if hi <= lo:
-        hi = lo + 1.0
-
-    data = np.clip(
-        (data - lo) / (hi - lo),
-        0.0,
-        1.0,
-    )
-
-    return data
-
-
-def load_uploaded_image(file_storage):
-    """
-    Supports common image formats and FITS.
-
-    FITS normalization is for visualization/prototyping and should
-    not be interpreted as calibrated astronomical photometry.
-    """
-
-    name = (
-        file_storage.filename or ""
-    ).lower()
-
-    if name.endswith(
-        (".fits", ".fit", ".fts")
-    ):
-        with fits.open(
-            file_storage.stream,
-            memmap=False,
-        ) as hdul:
-
-            image = None
-
+use_hard_start = st.sidebar.checkbox(
+    "Use hard-argmax localization (instead of soft-argmax)", value=False
+)
+
+flip_fits_vertically = st.sidebar.checkbox(
+    "Flip FITS frames vertically (astronomical origin)", value=True
+)
+
+gif_fps = st.sidebar.slider("Output GIF speed (fps)", 1, 10, 2)
+
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    f"Model expects {SEQ_LEN} frames of size {IMAGE_SIZE}x{IMAGE_SIZE}. "
+    f"Uploaded frames are resized to fit — if your real frames have a "
+    f"different field of view / plate scale than the synthetic training "
+    f"data, predicted velocities are only relative, not physically "
+    f"calibrated to arcsec/frame."
+)
+
+if not HAVE_ASTROPY:
+    st.sidebar.warning("astropy is not installed — FITS uploads will fail. `pip install astropy`.")
+
+
+# ---------------------------------------------------------------- #
+# File loading helpers
+# ---------------------------------------------------------------- #
+def load_frame_array(uploaded_file) -> np.ndarray:
+    """Load a single uploaded FITS or PNG file as a float32 2D array."""
+    name = uploaded_file.name.lower()
+    data = uploaded_file.read()
+
+    if name.endswith((".fits", ".fit")):
+        if not HAVE_ASTROPY:
+            raise RuntimeError("astropy is required to read FITS files (pip install astropy).")
+
+        with fits.open(io.BytesIO(data)) as hdul:
+            arr = None
             for hdu in hdul:
-                if getattr(hdu, "data", None) is not None:
-                    image = hdu.data
+                if hdu.data is not None:
+                    arr = hdu.data
                     break
+            if arr is None:
+                raise ValueError(f"No image data found in FITS file: {uploaded_file.name}")
 
-            if image is None:
-                raise ValueError(
-                    "No image data found in FITS file."
-                )
-
-        image = normalize_fits(image)
-
-        image = Image.fromarray(
-            (image * 255).astype(np.uint8)
-        )
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim == 3:
+            arr = arr[0]
+        if flip_fits_vertically:
+            arr = np.flipud(arr)
 
     else:
-        image = Image.open(
-            file_storage.stream
-        ).convert("L")
+        img = Image.open(io.BytesIO(data)).convert("L")
+        arr = np.asarray(img, dtype=np.float32)
 
-    image = image.resize(
-        (IMAGE_SIZE, IMAGE_SIZE),
-        Image.Resampling.LANCZOS,
-    )
+    return arr
 
-    return np.asarray(
-        image,
-        dtype=np.float32,
-    ) / 255.0
 
+def resize_to_model_input(arr: np.ndarray) -> np.ndarray:
+    """Resize a 2D array to IMAGE_SIZE x IMAGE_SIZE via PIL (bilinear)."""
+    img = Image.fromarray(arr)
+    img = img.resize((IMAGE_SIZE, IMAGE_SIZE), resample=Image.BILINEAR)
+    return np.asarray(img, dtype=np.float32)
 
-# ============================================================
-# BLIP
-# ============================================================
 
-def make_blips(raw):
-    """
-    Build signed difference/BLIP frames after ALL four inputs
-    have been loaded.
-    """
+def normalize_for_display(arr: np.ndarray) -> np.ndarray:
+    """Percentile stretch of a raw frame, for viewing only."""
+    lo, hi = np.percentile(arr, [1, 99])
+    if hi <= lo:
+        hi = lo + 1.0
+    out = np.clip((arr - lo) / (hi - lo), 0, 1)
+    return (out * 255).astype(np.uint8)
 
-    reference = np.median(
-        raw,
-        axis=0,
-    )
 
-    residual = (
-        raw
-        - reference[None]
-    )
+def blip_to_display(blip: np.ndarray) -> np.ndarray:
+    """BLIP frame in [-1, 1] -> uint8 grayscale for display."""
+    out = (blip + 1.0) / 2.0
+    return (np.clip(out, 0, 1) * 255).astype(np.uint8)
 
-    med = np.median(
-        residual
-    )
 
-    mad = np.median(
-        np.abs(
-            residual - med
-        )
-    )
+# ---------------------------------------------------------------- #
+# Upload
+# ---------------------------------------------------------------- #
+st.subheader("1. Upload 4 sequential frames")
 
-    scale = max(
-        1.4826 * mad * 6.0,
-        0.04,
-    )
-
-    return np.clip(
-        (residual - med) / scale,
-        -1.0,
-        1.0,
-    ).astype(np.float32)
-
-
-# ============================================================
-# VISUALIZATION
-# ============================================================
-
-def fig_to_base64(fig):
-    buffer = io.BytesIO()
-
-    fig.savefig(
-        buffer,
-        format="png",
-        dpi=130,
-        bbox_inches="tight",
-    )
-
-    plt.close(fig)
-
-    return base64.b64encode(
-        buffer.getvalue()
-    ).decode()
-
-
-def plot_four_frames(
-    data,
-    titles,
-    cmap="gray",
-    vmin=None,
-    vmax=None,
-):
-    fig, axes = plt.subplots(
-        1,
-        4,
-        figsize=(14, 3.5),
-    )
-
-    for t, ax in enumerate(axes):
-        ax.imshow(
-            data[t],
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-        )
-
-        ax.set_title(
-            titles[t]
-        )
-
-        ax.axis("off")
-
-    fig.tight_layout()
-
-    return fig_to_base64(fig)
-
-
-def plot_tracks(
-    blips,
-    tracks,
-):
-    fig, axes = plt.subplots(
-        1,
-        4,
-        figsize=(14, 3.5),
-    )
-
-    for t, ax in enumerate(axes):
-
-        ax.imshow(
-            blips[t],
-            cmap="gray",
-            vmin=-1,
-            vmax=1,
-        )
-
-        for track in tracks:
-
-            points = np.asarray(
-                track["points"]
-            )
-
-            ax.plot(
-                points[:, 0],
-                points[:, 1],
-                linewidth=2.0,
-                marker="o",
-                markersize=3,
-                label=(
-                    f"T{track['id']} "
-                    f"{track['confidence']:.2f}"
-                ),
-            )
-
-            ax.scatter(
-                points[t, 0],
-                points[t, 1],
-                marker="+",
-                s=130,
-                linewidths=2,
-            )
-
-        ax.set_title(
-            f"BLIP F{t}"
-        )
-
-        ax.axis("off")
-
-    if tracks:
-        axes[0].legend(
-            loc="upper right",
-            fontsize=8,
-        )
-
-    fig.tight_layout()
-
-    return fig_to_base64(fig)
-
-
-def plot_heatmaps(start_logits):
-    """
-    Show each prediction slot's spatial evidence independently.
-    """
-
-    k = start_logits.shape[0]
-
-    fig, axes = plt.subplots(
-        1,
-        k,
-        figsize=(4.0 * k, 4.0),
-    )
-
-    if k == 1:
-        axes = [axes]
-
-    for i, ax in enumerate(axes):
-        im = ax.imshow(
-            start_logits[i],
-            cmap="magma",
-        )
-
-        ax.set_title(
-            f"Slot {i}"
-        )
-
-        ax.axis("off")
-
-        fig.colorbar(
-            im,
-            ax=ax,
-            fraction=0.046,
-            pad=0.04,
-        )
-
-    fig.tight_layout()
-
-    return fig_to_base64(fig)
-
-
-# ============================================================
-# INFERENCE
-# ============================================================
-
-def infer(blips, threshold):
-    tensor = torch.from_numpy(
-        blips[:, None]
-    ).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        output = model(
-            tensor,
-            use_hard_start=False,
-        )
-
-        hard_output = model(
-            tensor,
-            use_hard_start=True,
-        )
-
-    probabilities = torch.sigmoid(
-        output["presence_logits"][0]
-    ).cpu().numpy()
-
-    soft_start = (
-        output["start"][0]
-        .cpu()
-        .numpy()
-    )
-
-    velocity = (
-        output["velocity"][0]
-        .cpu()
-        .numpy()
-    )
-
-    soft_coords = (
-        output["coords"][0]
-        .cpu()
-        .numpy()
-    )
-
-    hard_coords = (
-        hard_output["coords"][0]
-        .cpu()
-        .numpy()
-    )
-
-    start_logits = (
-        output["start_logits"][0]
-        .cpu()
-        .numpy()
-    )
-
-    tracks = []
-
-    for k in range(
-        len(probabilities)
-    ):
-
-        if probabilities[k] < threshold:
-            continue
-
-        # Use the soft trajectory for the main visualization.
-        # Hard coordinates are retained for diagnostics.
-        points = soft_coords[k]
-
-        tracks.append(
-            {
-                "id": k,
-                "confidence": float(
-                    probabilities[k]
-                ),
-                "start_x": float(
-                    soft_start[k, 0]
-                ),
-                "start_y": float(
-                    soft_start[k, 1]
-                ),
-                "vx": float(
-                    velocity[k, 0]
-                ),
-                "vy": float(
-                    velocity[k, 1]
-                ),
-                "points": [
-                    [
-                        float(p[0]),
-                        float(p[1]),
-                    ]
-                    for p in points
-                ],
-                "hard_points": [
-                    [
-                        float(p[0]),
-                        float(p[1]),
-                    ]
-                    for p in hard_coords[k]
-                ],
-            }
-        )
-
-    tracks.sort(
-        key=lambda x: x["confidence"],
-        reverse=True,
-    )
-
-    return (
-        tracks,
-        start_logits,
-    )
-
-
-# ============================================================
-# ROUTE
-# ============================================================
-
-@app.route(
-    "/",
-    methods=["GET", "POST"],
+uploaded_files = st.file_uploader(
+    f"Drop exactly {SEQ_LEN} frames, in time order (t=0 first)",
+    type=["fits", "fit", "png"],
+    accept_multiple_files=True,
 )
-def home():
 
-    if request.method == "GET":
-        return render_template_string(
-            HTML,
-            error=None,
-            results=None,
-            threshold=DEFAULT_THRESHOLD,
-        )
+ready = uploaded_files is not None and len(uploaded_files) == SEQ_LEN
+
+if uploaded_files and not ready:
+    st.warning(
+        f"Model expects exactly {SEQ_LEN} frames — you uploaded "
+        f"{len(uploaded_files)}. Add or remove files to continue."
+    )
+
+raw_stack = None
+
+if ready:
+    st.caption(
+        "Order below is upload order and is treated as t=0..t=3. "
+        "Re-upload in the correct order if this looks wrong."
+    )
 
     try:
-        threshold = float(
-            request.form.get(
-                "threshold",
-                DEFAULT_THRESHOLD,
-            )
-        )
+        raw_arrays = [resize_to_model_input(load_frame_array(f)) for f in uploaded_files]
+    except Exception as e:
+        st.error(f"Failed to load one or more frames: {e}")
+        raw_arrays = None
 
-        threshold = float(
-            np.clip(
-                threshold,
-                0.0,
-                1.0,
-            )
-        )
-
-        uploads = [
-            request.files.get(
-                f"f{i}"
-            )
-            for i in range(4)
-        ]
-
-        if any(
-            f is None or not f.filename
-            for f in uploads
-        ):
-            raise ValueError(
-                "Please provide all four chronological frames."
-            )
-
-        # IMPORTANT:
-        # Load ALL FOUR before making any BLIP.
-        raw = np.stack(
-            [
-                load_uploaded_image(f)
-                for f in uploads
-            ],
-            axis=0,
-        )
-
-        blips = make_blips(
-            raw
-        )
-
-        tracks, start_logits = infer(
-            blips,
-            threshold,
-        )
-
-        raw_img = plot_four_frames(
-            raw,
-            [
-                "Input F0",
-                "Input F1",
-                "Input F2",
-                "Input F3",
-            ],
-            vmin=0,
-            vmax=1,
-        )
-
-        blip_img = plot_four_frames(
-            blips,
-            [
-                "BLIP F0",
-                "BLIP F1",
-                "BLIP F2",
-                "BLIP F3",
-            ],
-            vmin=-1,
-            vmax=1,
-        )
-
-        infer_img = plot_tracks(
-            blips,
-            tracks,
-        )
-
-        heat_img = plot_heatmaps(
-            start_logits
-        )
-
-        if tracks:
-            summary = (
-                f"Detected {len(tracks)} "
-                f"trajectory(s) above threshold "
-                f"{threshold:.2f}."
-            )
-        else:
-            summary = (
-                f"No trajectory exceeded "
-                f"threshold {threshold:.2f}."
-            )
-
-        return render_template_string(
-            HTML,
-            error=None,
-            results=tracks,
-            summary=summary,
-            threshold=threshold,
-            raw_img=raw_img,
-            blip_img=blip_img,
-            infer_img=infer_img,
-            heat_img=heat_img,
-        )
-
-    except Exception as exc:
-
-        return render_template_string(
-            HTML,
-            error=str(exc),
-            results=None,
-            threshold=DEFAULT_THRESHOLD,
-        )
+    if raw_arrays is not None:
+        cols = st.columns(SEQ_LEN)
+        for i, (f, arr) in enumerate(zip(uploaded_files, raw_arrays)):
+            with cols[i]:
+                st.image(
+                    normalize_for_display(arr),
+                    caption=f"t={i}  ({f.name})",
+                    use_container_width=True,
+                )
+        raw_stack = np.stack(raw_arrays).astype(np.float32)  # [T, H, W]
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# ---------------------------------------------------------------- #
+# Run inference
+# ---------------------------------------------------------------- #
+st.subheader("2. Run detection")
 
-if __name__ == "__main__":
+run_clicked = st.button("Run detection", type="primary", disabled=raw_stack is None)
 
-    print(
-        "[INFO] V5-M multi-target app"
+if run_clicked and raw_stack is not None:
+    ckpt_file = Path(checkpoint_path)
+    if not ckpt_file.exists():
+        st.error(f"Checkpoint not found:\n{checkpoint_path}")
+        st.stop()
+
+    try:
+        with st.spinner("Preprocessing (median-frame BLIP transform)..."):
+            blips = make_blips(raw_stack)  # [T, H, W] — identical to training
+
+        with st.spinner("Loading model and running inference..."):
+            model, device, epoch, run_name = load_model(str(ckpt_file))
+
+            frames_tensor = (
+                torch.from_numpy(blips[:, None]).unsqueeze(0).to(device)
+            )  # [1, T, 1, H, W]
+
+            with torch.no_grad():
+                output = model(frames_tensor, use_hard_start=use_hard_start)
+
+            pred_start = output["start"][0].cpu().numpy()                        # [K,2]
+            pred_velocity = output["velocity"][0].cpu().numpy()                  # [K,2]
+            pred_coords = output["coords"][0].cpu().numpy()                      # [K,T,2]
+            pred_score = torch.sigmoid(output["presence_logits"][0]).cpu().numpy()  # [K]
+
+    except Exception as e:
+        st.error(f"Inference failed: {e}")
+        st.stop()
+
+    st.success(f"Inference complete — checkpoint epoch {epoch} (run: {run_name})")
+
+    detections = [
+        {
+            "slot": k,
+            "confidence": float(pred_score[k]),
+            "start_x": float(pred_start[k, 0]),
+            "start_y": float(pred_start[k, 1]),
+            "velocity_x": float(pred_velocity[k, 0]),
+            "velocity_y": float(pred_velocity[k, 1]),
+            "detected": bool(pred_score[k] >= confidence_threshold),
+        }
+        for k in range(pred_start.shape[0])
+    ]
+    det_df = pd.DataFrame(detections)
+
+    st.subheader("3. Detections")
+    st.dataframe(det_df, use_container_width=True)
+    st.download_button(
+        "Download detections (CSV)",
+        data=det_df.to_csv(index=False).encode("utf-8"),
+        file_name="detections.csv",
+        mime="text/csv",
     )
 
-    print(
-        f"[INFO] Device: {device}"
+    if not det_df["detected"].any():
+        st.info("No slots passed the confidence threshold — try lowering it in the sidebar.")
+
+    # ------------------------------------------------------------ #
+    # Annotated frames + GIF
+    # ------------------------------------------------------------ #
+    st.subheader("4. Annotated tracklet")
+
+    slot_colors = ["#ff3b30", "#34c759", "#007aff"]  # up to MAX_TARGETS slots
+    annotated_frames = []
+
+    for t in range(SEQ_LEN):
+        base = Image.fromarray(blip_to_display(blips[t])).convert("RGB")
+        draw = ImageDraw.Draw(base)
+
+        for d in detections:
+            if not d["detected"]:
+                continue
+            k = d["slot"]
+            color = slot_colors[k % len(slot_colors)]
+
+            pts = [(pred_coords[k, i, 0], pred_coords[k, i, 1]) for i in range(SEQ_LEN)]
+            draw.line(pts, fill=color, width=2)
+
+            x, y = pred_coords[k, t]
+            r = 6
+            draw.ellipse([x - r, y - r, x + r, y + r], outline=color, width=2)
+            draw.text((x + 8, y - 8), f"T{k} {d['confidence']:.2f}", fill=color)
+
+        annotated_frames.append(base)
+
+    frame_cols = st.columns(SEQ_LEN)
+    for i, img in enumerate(annotated_frames):
+        with frame_cols[i]:
+            st.image(img, caption=f"t={i}", use_container_width=True)
+
+    gif_buffer = io.BytesIO()
+    duration_ms = int(1000 / gif_fps)
+    annotated_frames[0].save(
+        gif_buffer,
+        format="GIF",
+        save_all=True,
+        append_images=annotated_frames[1:],
+        duration=duration_ms,
+        loop=0,
+    )
+    gif_buffer.seek(0)
+
+    st.image(gif_buffer, caption="Predicted tracklet (looping)")
+    st.download_button(
+        "Download annotated GIF",
+        data=gif_buffer,
+        file_name="tracklet_detection.gif",
+        mime="image/gif",
     )
 
-    print(
-        f"[INFO] Max target slots: {MAX_TARGETS}"
-    )
-
-    print(
-        f"[INFO] Model: {MODEL_PATH}"
-    )
-
-    print(
-        "[INFO] Open http://127.0.0.1:5000"
-    )
-
-    app.run(
-        host="127.0.0.1",
-        port=5000,
-        debug=False,
-    )
+elif raw_stack is None:
+    st.info(f"Upload {SEQ_LEN} frames above to enable detection.")
