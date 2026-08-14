@@ -67,7 +67,7 @@ observation window.
 | `model.py` | The `V5MultiTargetDetector` architecture (bidirectional ConvLSTM + multi-slot heatmap head) |
 | `train_detector.py` | Training loop with `quick` / `overnight` / `research` presets |
 | `evaluate_detector.py` | Runs a trained checkpoint against a held-out synthetic validation set and reports precision/recall/F1/localization error |
-| `app.py` | Flask web app: upload 4 frames, get back detected trajectories. Automatically switches to an overlapping sliding-window scan for frames larger than the model's native 256×256 input |
+| `app.py` | Streamlit web app: upload 4 frames, get back detected trajectories. Automatically switches to an overlapping sliding-window scan for frames larger than the model's native 256×256 input |
 | `v5m_quick.pth` | Checkpoint from the fastest training preset (see Results) |
 
 ## Setup
@@ -112,9 +112,9 @@ broken down by how many true moving objects were in each scene.
 
 **4. Try it interactively**
 ```bash
-python app.py
+python -m streamlit run app.py
 ```
-Open `http://127.0.0.1:5000`, upload 4 chronological frames (image or FITS),
+The app should open in a broswer, upload 4 chronological frames (image or FITS),
 and get back detected trajectories overlaid on the BLIP-differenced images.
 Frames ≤256×256 are used as-is; larger frames are automatically scanned with
 overlapping windows, with duplicate detections from overlapping windows
